@@ -1,0 +1,351 @@
+diff --git a/core/modules/rest/config/schema/rest.views.schema.yml b/core/modules/rest/config/schema/rest.views.schema.yml
+index a914081..040187a 100644
+--- a/core/modules/rest/config/schema/rest.views.schema.yml
++++ b/core/modules/rest/config/schema/rest.views.schema.yml
+@@ -3,6 +3,13 @@
+ views.display.rest_export:
+   type: views_display_path
+   label: 'REST display options'
++  mapping:
++    auth:
++      type: sequence
++      label: 'Authentication'
++      sequence:
++        type: string
++        label: 'Authentication Provider'
+ 
+ views.row.data_field:
+   type: views_row
+diff --git a/core/modules/rest/rest.install b/core/modules/rest/rest.install
+index 4bca69b..78e1ca9 100644
+--- a/core/modules/rest/rest.install
++++ b/core/modules/rest/rest.install
+@@ -21,3 +21,34 @@ function rest_requirements($phase) {
+   }
+   return $requirements;
+ }
++
++/**
++ * @addtogroup updates-8.0.x
++ * @{
++ */
++
++/**
++ * Re-save all views with a REST display to add new auth defaults.
++ */
++function rest_update_8001() {
++  $config_factory = \Drupal::configFactory();
++  foreach ($config_factory->listAll('views.view.') as $view_config_name) {
++    $save = FALSE;
++    $view = $config_factory->getEditable($view_config_name);
++    $displays = $view->get('display');
++    foreach ($displays as $display_name => &$display) {
++      if ($display['display_plugin'] == 'rest_export') {
++        $display['display_options']['auth'] = [];
++        $save = TRUE;
++      }
++    }
++    if ($save) {
++      $view->set('display', $displays);
++      $view->save(TRUE);
++    }
++  }
++}
++
++/**
++ * @} End of "addtogroup updates-8.0.x".
++ */
+diff --git a/core/modules/rest/src/Plugin/views/display/RestExport.php b/core/modules/rest/src/Plugin/views/display/RestExport.php
+index 68bd407..c49f78e 100644
+--- a/core/modules/rest/src/Plugin/views/display/RestExport.php
++++ b/core/modules/rest/src/Plugin/views/display/RestExport.php
+@@ -9,6 +9,7 @@
+ 
+ use Drupal\Core\Cache\CacheableMetadata;
+ use Drupal\Core\Cache\CacheableResponse;
++use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Render\RenderContext;
+ use Drupal\Core\Render\RendererInterface;
+ use Drupal\Core\Routing\RouteProviderInterface;
+@@ -19,6 +20,7 @@
+ use Drupal\views\Plugin\views\display\PathPluginBase;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\Routing\RouteCollection;
++use Drupal\Core\Authentication\AuthenticationCollectorInterface;
+ 
+ /**
+  * The plugin that handles Data response callbacks for REST resources.
+@@ -83,6 +85,13 @@ class RestExport extends PathPluginBase implements ResponseDisplayPluginInterfac
+   protected $renderer;
+ 
+   /**
++   * The collector of authentication providers.
++   *
++   * @var \Drupal\Core\Authentication\AuthenticationCollectorInterface
++   */
++  protected $authenticationCollector;
++
++  /**
+    * Constructs a RestExport object.
+    *
+    * @param array $configuration
+@@ -97,11 +106,14 @@ class RestExport extends PathPluginBase implements ResponseDisplayPluginInterfac
+    *   The state key value store.
+    * @param \Drupal\Core\Render\RendererInterface $renderer
+    *   The renderer.
++   * @param \Drupal\Core\Authentication\AuthenticationCollectorInterface $authentication_collector
++   *   The collector of authentication providers.
+    */
+-  public function __construct(array $configuration, $plugin_id, $plugin_definition, RouteProviderInterface $route_provider, StateInterface $state, RendererInterface $renderer) {
++  public function __construct(array $configuration, $plugin_id, $plugin_definition, RouteProviderInterface $route_provider, StateInterface $state, RendererInterface $renderer, AuthenticationCollectorInterface $authentication_collector) {
+     parent::__construct($configuration, $plugin_id, $plugin_definition, $route_provider, $state);
+ 
+     $this->renderer = $renderer;
++    $this->authenticationCollector = $authentication_collector;
+   }
+ 
+   /**
+@@ -114,7 +126,9 @@ public static function create(ContainerInterface $container, array $configuratio
+       $plugin_definition,
+       $container->get('router.route_provider'),
+       $container->get('state'),
+-      $container->get('renderer')
++      $container->get('renderer'),
++      $container->get('authentication_collector')
++
+     );
+   }
+   /**
+@@ -205,11 +219,25 @@ public function getContentType() {
+   }
+ 
+   /**
++   * Gets the auth options available.
++   *
++   * @return string[]
++   *   An array to use as value for "#options" in the form element.
++   */
++  public function getAuthOptions() {
++    $authentication_providers = array_keys($this->authenticationCollector->getSortedProviders());
++    return array_combine($authentication_providers, $authentication_providers);
++  }
++
++  /**
+    * {@inheritdoc}
+    */
+   protected function defineOptions() {
+     $options = parent::defineOptions();
+ 
++    // Options for REST authentication.
++    $options['auth'] = array('default' => array());
++
+     // Set the default style plugin to 'json'.
+     $options['style']['contains']['type']['default'] = 'serializer';
+     $options['row']['contains']['type']['default'] = 'data_entity';
+@@ -230,6 +258,9 @@ protected function defineOptions() {
+   public function optionsSummary(&$categories, &$options) {
+     parent::optionsSummary($categories, $options);
+ 
++    // Authentication.
++    $auth = $this->getOption('auth') ? implode(', ', $this->getOption('auth')) : $this->t('No authentication is set');
++
+     unset($categories['page'], $categories['exposed']);
+     // Hide some settings, as they aren't useful for pure data output.
+     unset($options['show_admin_links'], $options['analyze-theme']);
+@@ -244,6 +275,11 @@ public function optionsSummary(&$categories, &$options) {
+ 
+     $options['path']['category'] = 'path';
+     $options['path']['title'] = $this->t('Path');
++    $options['auth'] = array(
++      'category' => 'path',
++      'title' => $this->t('Authentication'),
++      'value' => views_ui_truncate($auth, 24),
++    );
+ 
+     // Remove css/exposed form settings, as they are not used for the data
+     // display.
+@@ -255,6 +291,34 @@ public function optionsSummary(&$categories, &$options) {
+   /**
+    * {@inheritdoc}
+    */
++  public function buildOptionsForm(&$form, FormStateInterface $form_state) {
++    parent::buildOptionsForm($form, $form_state);
++    if ($form_state->get('section') === 'auth') {
++      $form['#title'] .= $this->t('The supported authentication methods for this view');
++      $form['auth'] = array(
++        '#type' => 'checkboxes',
++        '#title' => $this->t('Authentication methods'),
++        '#description' => $this->t('These are the supported authentication providers for this view. When this view is requested, the client will be forced to authenticate with one of the selected providers. Make sure you set the appropiate requirements at the <em>Access</em> section since the Authentication System will fallback to the anonymous user if it fails to authenticate. For example: require Access: Role | Authenticated User.'),
++        '#options' => $this->getAuthOptions(),
++        '#default_value' => $this->getOption('auth'),
++      );
++    }
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function submitOptionsForm(&$form, FormStateInterface $form_state) {
++    parent::submitOptionsForm($form, $form_state);
++
++    if ($form_state->get('section') == 'auth') {
++      $this->setOption('auth', array_filter($form_state->getValue('auth')));
++    }
++  }
++
++  /**
++   * {@inheritdoc}
++   */
+   public function collectRoutes(RouteCollection $collection) {
+     parent::collectRoutes($collection);
+     $view_id = $this->view->storage->id();
+@@ -273,6 +337,13 @@ public function collectRoutes(RouteCollection $collection) {
+         // anyway.
+         $route->setRequirement('_format', implode('|', $formats + ['html']));
+       }
++      // Add authentication to the route if it was set. If no authentication was
++      // set, the default authentication will be used, which is cookie based by
++      // default.
++      $auth = $this->getOption('auth');
++      if (!empty($auth)) {
++        $route->setOption('_auth', $auth);
++      }
+     }
+   }
+ 
+diff --git a/core/modules/rest/src/Tests/Views/StyleSerializerTest.php b/core/modules/rest/src/Tests/Views/StyleSerializerTest.php
+index b590504..632f3a7 100644
+--- a/core/modules/rest/src/Tests/Views/StyleSerializerTest.php
++++ b/core/modules/rest/src/Tests/Views/StyleSerializerTest.php
+@@ -43,7 +43,7 @@ class StyleSerializerTest extends PluginTestBase {
+    *
+    * @var array
+    */
+-  public static $modules = array('views_ui', 'entity_test', 'hal', 'rest_test_views', 'node', 'text', 'field');
++  public static $modules = array('views_ui', 'entity_test', 'hal', 'rest_test_views', 'node', 'text', 'field', 'basic_auth');
+ 
+   /**
+    * Views used by this test.
+@@ -73,6 +73,46 @@ protected function setUp() {
+   }
+ 
+   /**
++   * Checks that the auth options restricts access to a REST views display.
++   */
++  public function testRestViewsPermissions() {
++    // Assume the view is hidden behind a permission.
++    $this->drupalGetWithFormat('test/serialize/auth_with_perm', 'json');
++    $this->assertResponse(401);
++
++    // Not even logging in would make it possible to see the view, because then
++    // we are denied based on authentication method (cookie).
++    $this->drupalLogin($this->adminUser);
++    $this->drupalGetWithFormat('test/serialize/auth_with_perm', 'json');
++    $this->assertResponse(403);
++    $this->drupalLogout();
++
++    // But if we use the basic auth authentication strategy, we should be able
++    // to see the page.
++    $url = $this->buildUrl('test/serialize/auth_with_perm');
++    $curl_options = array(
++      CURLOPT_HTTPGET => TRUE,
++      CURLOPT_CUSTOMREQUEST => 'GET',
++      CURLOPT_URL => $url,
++      CURLOPT_NOBODY => FALSE,
++      CURLOPT_HTTPHEADER => [
++        'Authorization: Basic ' . base64_encode($this->adminUser->getUsername() . ':' . $this->adminUser->pass_raw),
++      ],
++    );
++    $this->responseBody = $this->curlExec($curl_options);
++
++    // Ensure that any changes to variables in the other thread are picked up.
++    $this->refreshVariables();
++
++    $headers = $this->drupalGetHeaders();
++    $this->verbose('GET request to: ' . $url .
++      '<hr />Code: ' . curl_getinfo($this->curlHandle, CURLINFO_HTTP_CODE) .
++      '<hr />Response headers: ' . nl2br(print_r($headers, TRUE)) .
++      '<hr />Response body: ' . $this->responseBody);
++    $this->assertResponse(200);
++  }
++
++  /**
+    * Checks the behavior of the Serializer callback paths and row plugins.
+    */
+   public function testSerializerResponses() {
+diff --git a/core/modules/rest/tests/modules/rest_test_views/test_views/views.view.test_serializer_node_display_field.yml b/core/modules/rest/tests/modules/rest_test_views/test_views/views.view.test_serializer_node_display_field.yml
+index 34133a5..4a09bbd 100644
+--- a/core/modules/rest/tests/modules/rest_test_views/test_views/views.view.test_serializer_node_display_field.yml
++++ b/core/modules/rest/tests/modules/rest_test_views/test_views/views.view.test_serializer_node_display_field.yml
+@@ -27,7 +27,7 @@ display:
+       access:
+         type: perm
+         options:
+-          perm: 'access content'
++          perm: 'administer views'
+       cache:
+         type: tag
+       query:
+@@ -149,3 +149,24 @@ display:
+         type: serializer
+       row:
+         type: data_field
++
++  rest_export_2:
++    display_plugin: rest_export
++    id: rest_export_2
++    display_title: 'REST export 2'
++    position: 2
++    display_options:
++      display_extenders: {  }
++      auth:
++        basic_auth: basic_auth
++      path: test/serialize/auth_with_perm
++    cache_metadata:
++      max-age: -1
++      contexts:
++        - 'languages:language_content'
++        - 'languages:language_interface'
++        - request_format
++        - 'user.node_grants:view'
++        - user.permissions
++      tags:
++        - 'config:field.storage.node.body'
+diff --git a/core/modules/rest/tests/src/Unit/CollectRoutesTest.php b/core/modules/rest/tests/src/Unit/CollectRoutesTest.php
+index 8b5d215..190f088 100644
+--- a/core/modules/rest/tests/src/Unit/CollectRoutesTest.php
++++ b/core/modules/rest/tests/src/Unit/CollectRoutesTest.php
+@@ -81,6 +81,12 @@ protected function setUp() {
+     $container->set('plugin.manager.views.style', $style_manager);
+     $container->set('renderer', $this->getMock('Drupal\Core\Render\RendererInterface'));
+ 
++    $authentication_collector = $this->getMock('\Drupal\Core\Authentication\AuthenticationCollectorInterface');
++    $container->set('authentication_collector', $authentication_collector);
++    $authentication_collector->expects($this->any())
++      ->method('getSortedProviders')
++      ->will($this->returnValue(array('basic_auth' => 'data', 'cookie' => 'data')));
++
+     \Drupal::setContainer($container);
+ 
+     $this->restExport = RestExport::create($container, array(), "test_routes", array());
+@@ -92,6 +98,9 @@ protected function setUp() {
+     // Set the style option.
+     $this->restExport->setOption('style', array('type' => 'serializer'));
+ 
++    // Set the auth option.
++    $this->restExport->setOption('auth', ['basic_auth']);
++
+     $display_manager->expects($this->once())
+       ->method('getDefinition')
+       ->will($this->returnValue(array('id' => 'test', 'provider' => 'test')));
+@@ -137,5 +146,10 @@ public function testRoutesRequirements() {
+ 
+     $this->assertEquals(count($requirements_1), 0, 'First route has no requirement.');
+     $this->assertEquals(count($requirements_2), 2, 'Views route with rest export had the format and method requirements added.');
++
++    // Check auth options.
++    $auth = $this->routes->get('view.test_view.page_1')->getOption('_auth');
++    $this->assertEquals(count($auth), 1, 'View route with rest export has an auth option added');
++    $this->assertEquals($auth[0], 'basic_auth', 'View route with rest export has the correct auth option added');
+   }
+ }
